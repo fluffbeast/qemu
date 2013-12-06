@@ -43,7 +43,6 @@
 //#define DEBUG_CIRRUS
 //#define DEBUG_BITBLT
 
-#define VGA_RAM_SIZE (8192 * 1024)
 /***************************************
  *
  *  definitions
@@ -2440,6 +2439,7 @@ static uint32_t cirrus_vga_ioport_read(void *opaque, uint32_t addr)
     VGACommonState *s = &c->vga;
     int val, index;
 
+    qemu_flush_coalesced_mmio_buffer();
     if (vga_ioport_invalid(s, addr)) {
 	val = 0xff;
     } else {
@@ -2533,6 +2533,7 @@ static void cirrus_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
     VGACommonState *s = &c->vga;
     int index;
 
+    qemu_flush_coalesced_mmio_buffer();
     /* check port range access depending on color/monochrome mode */
     if (vga_ioport_invalid(s, addr)) {
 	return;
@@ -2852,7 +2853,8 @@ static void cirrus_init_common(CirrusVGAState * s, int device_id, int is_pci,
 
     /* I/O handler for LFB */
     memory_region_init_io(&s->cirrus_linear_io, &cirrus_linear_io_ops, s,
-                          "cirrus-linear-io", VGA_RAM_SIZE);
+                          "cirrus-linear-io", s->vga.vram_size_mb
+                                              * 1024 * 1024);
 
     /* I/O handler for LFB */
     memory_region_init_io(&s->cirrus_linear_bitblt_io,
@@ -2892,7 +2894,6 @@ static int vga_initfn(ISADevice *dev)
     ISACirrusVGAState *d = DO_UPCAST(ISACirrusVGAState, dev, dev);
     VGACommonState *s = &d->cirrus_vga.vga;
 
-    s->vram_size_mb = VGA_RAM_SIZE >> 20;
     vga_common_init(s);
     cirrus_init_common(&d->cirrus_vga, CIRRUS_ID_CLGD5430, 0,
                        isa_address_space(dev));
@@ -2935,7 +2936,6 @@ static int pci_cirrus_vga_initfn(PCIDevice *dev)
      int16_t device_id = pc->device_id;
 
      /* setup VGA */
-     s->vga.vram_size_mb = VGA_RAM_SIZE >> 20;
      vga_common_init(&s->vga);
      cirrus_init_common(s, device_id, 1, pci_address_space(dev));
      s->vga.ds = graphic_console_init(s->vga.update, s->vga.invalidate,
