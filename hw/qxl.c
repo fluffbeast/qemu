@@ -27,10 +27,6 @@
 
 #include "qxl.h"
 
-#ifndef CONFIG_QXL_IO_MONITORS_CONFIG_ASYNC
-/* spice-protocol is too old, add missing definitions */
-#define QXL_IO_MONITORS_CONFIG_ASYNC (QXL_IO_FLUSH_RELEASE + 1)
-#endif
 /*
  * NOTE: SPICE_RING_PROD_ITEM accesses memory on the pci bar and as
  * such can be changed by the guest, so to avoid a guest trigerrable
@@ -241,7 +237,8 @@ static void qxl_spice_destroy_surfaces_complete(PCIQXLDevice *qxl)
 {
     trace_qxl_spice_destroy_surfaces_complete(qxl->id);
     qemu_mutex_lock(&qxl->track_lock);
-    memset(&qxl->guest_surfaces.cmds, 0, sizeof(qxl->guest_surfaces.cmds));
+    memset(qxl->guest_surfaces.cmds, 0,
+           sizeof(qxl->guest_surfaces.cmds) * qxl->ssd.num_surfaces);
     qxl->guest_surfaces.count = 0;
     qemu_mutex_unlock(&qxl->track_lock);
 }
@@ -262,9 +259,7 @@ static void qxl_spice_destroy_surfaces(PCIQXLDevice *qxl, qxl_async_io async)
 static void qxl_spice_monitors_config_async(PCIQXLDevice *qxl, int replay)
 {
     trace_qxl_spice_monitors_config(qxl->id);
-/* 0x000b01 == 0.11.1 */
-#if SPICE_SERVER_VERSION >= 0x000b01 && \
-    defined(CONFIG_QXL_IO_MONITORS_CONFIG_ASYNC)
+
     if (replay) {
         /*
          * don't use QXL_COOKIE_TYPE_IO:
@@ -286,10 +281,6 @@ static void qxl_spice_monitors_config_async(PCIQXLDevice *qxl, int replay)
                 (uintptr_t)qxl_cookie_new(QXL_COOKIE_TYPE_IO,
                                           QXL_IO_MONITORS_CONFIG_ASYNC));
     }
-#else
-    fprintf(stderr, "qxl: too old spice-protocol/spice-server for "
-            "QXL_IO_MONITORS_CONFIG_ASYNC\n");
-#endif
 }
 void qxl_spice_reset_image_cache(PCIQXLDevice *qxl)
 {
@@ -304,6 +295,10 @@ void qxl_spice_reset_cursor(PCIQXLDevice *qxl)
     qemu_mutex_lock(&qxl->track_lock);
     qxl->guest_cursor = 0;
     qemu_mutex_unlock(&qxl->track_lock);
+    if (qxl->ssd.cursor) {
+        cursor_put(qxl->ssd.cursor);
+    }
+    qxl->ssd.cursor = cursor_builtin_hidden();
 }
 
 
@@ -348,7 +343,7 @@ static void init_qxl_rom(PCIQXLDevice *d)
     rom->slot_id_bits  = MEMSLOT_SLOT_BITS;
     rom->slots_start   = 1;
     rom->slots_end     = NUM_MEMSLOTS - 1;
-    rom->n_surfaces    = cpu_to_le32(NUM_SURFACES);
+    rom->n_surfaces    = cpu_to_le32(d->ssd.num_surfaces);
 
     for (i = 0, n = 0; i < ARRAY_SIZE(qxl_modes); i++) {
         fb = qxl_modes[i].y_res * qxl_modes[i].stride;
@@ -452,9 +447,15 @@ static int qxl_track_command(PCIQXLDevice *qxl, struct QXLCommandExt *ext)
         }
         uint32_t id = le32_to_cpu(cmd->surface_id);
 
-        if (id >= NUM_SURFACES) {
+        if (id >= qxl->ssd.num_surfaces) {
             qxl_set_guest_bug(qxl, "QXL_CMD_SURFACE id %d >= %d", id,
-                              NUM_SURFACES);
+                              qxl->ssd.num_surfaces);
+            return 1;
+        }
+        if (cmd->type == QXL_SURFACE_CMD_CREATE &&
+            (cmd->u.surface_create.stride & 0x03) != 0) {
+            qxl_set_guest_bug(qxl, "QXL_CMD_SURFACE stride = %d %% 4 != 0\n",
+                              cmd->u.surface_create.stride);
             return 1;
         }
         qemu_mutex_lock(&qxl->track_lock);
@@ -530,7 +531,7 @@ static void interface_get_init_info(QXLInstance *sin, QXLDevInitInfo *info)
     info->num_memslots_groups = NUM_MEMSLOTS_GROUPS;
     info->internal_groupslot_id = 0;
     info->qxl_ram_size = le32_to_cpu(qxl->shadow_rom.num_pages) << TARGET_PAGE_BITS;
-    info->n_surfaces = NUM_SURFACES;
+    info->n_surfaces = qxl->ssd.num_surfaces;
 }
 
 static const char *qxl_mode_to_string(int mode)
@@ -1275,6 +1276,11 @@ static void qxl_create_guest_primary(PCIQXLDevice *qxl, int loadvm,
     trace_qxl_create_guest_primary_rest(qxl->id, sc->stride, sc->type,
                                         sc->flags);
 
+    if ((surface.stride & 0x3) != 0) {
+        qxl_set_guest_bug(qxl, "primary surface stride = %d %% 4 != 0",
+                          surface.stride);
+        return;
+    }
     surface.mouse_mode = true;
     surface.group_id   = MEMSLOT_GROUP_GUEST;
     if (loadvm) {
@@ -1338,11 +1344,9 @@ static void qxl_set_mode(PCIQXLDevice *d, int modenr, int loadvm)
 
     d->mode = QXL_MODE_COMPAT;
     d->cmdflags = QXL_COMMAND_FLAG_COMPAT;
-#ifdef QXL_COMMAND_FLAG_COMPAT_16BPP /* new in spice 0.6.1 */
     if (mode->bits == 16) {
         d->cmdflags |= QXL_COMMAND_FLAG_COMPAT_16BPP;
     }
-#endif
     d->shadow_rom.mode = cpu_to_le32(modenr);
     d->rom->mode = cpu_to_le32(modenr);
     qxl_rom_set_dirty(d);
@@ -1438,23 +1442,16 @@ async_common:
         QXLCookie *cookie = NULL;
         QXLRect update = d->ram->update_area;
 
-        if (d->ram->update_surface > NUM_SURFACES) {
+        if (d->ram->update_surface > d->ssd.num_surfaces) {
             qxl_set_guest_bug(d, "QXL_IO_UPDATE_AREA: invalid surface id %d\n",
                               d->ram->update_surface);
-            return;
+            break;
         }
-        if (update.left >= update.right || update.top >= update.bottom) {
+        if (update.left >= update.right || update.top >= update.bottom ||
+            update.left < 0 || update.top < 0) {
             qxl_set_guest_bug(d,
                     "QXL_IO_UPDATE_AREA: invalid area (%ux%u)x(%ux%u)\n",
                     update.left, update.top, update.right, update.bottom);
-            return;
-        }
-
-        if (update.left < 0 || update.top < 0 || update.left >= update.right ||
-            update.top >= update.bottom) {
-            qxl_set_guest_bug(d, "QXL_IO_UPDATE_AREA: "
-                              "invalid area(%d,%d,%d,%d)\n", update.left,
-                              update.right, update.top, update.bottom);
             break;
         }
         if (async == QXL_ASYNC) {
@@ -1488,6 +1485,7 @@ async_common:
         qxl_set_mode(d, val, 0);
         break;
     case QXL_IO_LOG:
+        trace_qxl_io_log(d->id, d->ram->log_buf);
         if (d->guestdebug) {
             fprintf(stderr, "qxl/guest-%d: %" PRId64 ": %s", d->id,
                     qemu_get_clock_ns(vm_clock), d->ram->log_buf);
@@ -1538,7 +1536,7 @@ async_common:
         }
         break;
     case QXL_IO_DESTROY_SURFACE_WAIT:
-        if (val >= NUM_SURFACES) {
+        if (val >= d->ssd.num_surfaces) {
             qxl_set_guest_bug(d, "QXL_IO_DESTROY_SURFACE (async=%d):"
                              "%" PRIu64 " >= NUM_SURFACES", async, val);
             goto cancel_async;
@@ -1614,7 +1612,13 @@ static void qxl_send_events(PCIQXLDevice *d, uint32_t events)
     uint32_t le_events = cpu_to_le32(events);
 
     trace_qxl_send_events(d->id, events);
-    assert(qemu_spice_display_is_running(&d->ssd));
+    if (!qemu_spice_display_is_running(&d->ssd)) {
+        /* spice-server tracks guest running state and should not do this */
+        fprintf(stderr, "%s: spice-server bug: guest stopped, ignoring\n",
+                __func__);
+        trace_qxl_send_events_vm_stopped(d->id, events);
+        return;
+    }
     old_pending = __sync_fetch_and_or(&d->ram->int_pending, le_events);
     if ((old_pending & le_events) == le_events) {
         return;
@@ -1717,7 +1721,7 @@ static void qxl_dirty_surfaces(PCIQXLDevice *qxl)
     vram_start =  (intptr_t)memory_region_get_ram_ptr(&qxl->vram_bar);
 
     /* dirty the off-screen surfaces */
-    for (i = 0; i < NUM_SURFACES; i++) {
+    for (i = 0; i < qxl->ssd.num_surfaces; i++) {
         QXLSurfaceCmd *cmd;
         intptr_t surface_offset;
         int surface_size;
@@ -1845,7 +1849,6 @@ static int qxl_init_common(PCIQXLDevice *qxl)
     qxl->mode = QXL_MODE_UNDEFINED;
     qxl->generation = 1;
     qxl->num_memslots = NUM_MEMSLOTS;
-    qxl->num_surfaces = NUM_SURFACES;
     qemu_mutex_init(&qxl->track_lock);
     qemu_mutex_init(&qxl->async_lock);
     qxl->current_async = QXL_UNDEFINED_IO;
@@ -1864,14 +1867,10 @@ static int qxl_init_common(PCIQXLDevice *qxl)
         pci_device_rev = QXL_REVISION_STABLE_V10;
         io_size = 32; /* PCI region size must be pow2 */
         break;
-/* 0x000b01 == 0.11.1 */
-#if SPICE_SERVER_VERSION >= 0x000b01 && \
-        defined(CONFIG_QXL_IO_MONITORS_CONFIG_ASYNC)
     case 4: /* qxl-4 */
         pci_device_rev = QXL_REVISION_STABLE_V12;
         io_size = msb_mask(QXL_IO_RANGE_SIZE * 2 - 1);
         break;
-#endif
     default:
         pci_device_rev = QXL_DEFAULT_REVISION;
         io_size = msb_mask(QXL_IO_RANGE_SIZE * 2 - 1);
@@ -1887,6 +1886,7 @@ static int qxl_init_common(PCIQXLDevice *qxl)
     init_qxl_rom(qxl);
     init_qxl_ram(qxl);
 
+    qxl->guest_surfaces.cmds = g_new0(QXLPHYSICAL, qxl->ssd.num_surfaces);
     memory_region_init_ram(&qxl->vram_bar, "qxl.vram", qxl->vram_size);
     vmstate_register_ram(&qxl->vram_bar, &qxl->pci.qdev);
     memory_region_init_alias(&qxl->vram32_bar, "qxl.vram32", &qxl->vram_bar,
@@ -1935,7 +1935,11 @@ static int qxl_init_common(PCIQXLDevice *qxl)
 
     qxl->ssd.qxl.base.sif = &qxl_interface.base;
     qxl->ssd.qxl.id = qxl->id;
-    qemu_spice_add_interface(&qxl->ssd.qxl.base);
+    if (qemu_spice_add_interface(&qxl->ssd.qxl.base) != 0) {
+        error_report("qxl interface %d.%d not supported by spice-server\n",
+                     SPICE_INTERFACE_QXL_MAJOR, SPICE_INTERFACE_QXL_MINOR);
+        return -1;
+    }
     qemu_add_vm_change_state_handler(qxl_vm_change_state_handler, qxl);
 
     init_pipe_signaling(qxl);
@@ -1951,6 +1955,7 @@ static int qxl_init_primary(PCIDevice *dev)
     PCIQXLDevice *qxl = DO_UPCAST(PCIQXLDevice, pci, dev);
     VGACommonState *vga = &qxl->vga;
     PortioList *qxl_vga_port_list = g_new(PortioList, 1);
+    int rc;
 
     qxl->id = 0;
     qxl_init_ramsize(qxl);
@@ -1965,9 +1970,14 @@ static int qxl_init_primary(PCIDevice *dev)
     qemu_spice_display_init_common(&qxl->ssd, vga->ds);
 
     qxl0 = qxl;
-    register_displaychangelistener(vga->ds, &display_listener);
 
-    return qxl_init_common(qxl);
+    rc = qxl_init_common(qxl);
+    if (rc != 0) {
+        return rc;
+    }
+
+    register_displaychangelistener(vga->ds, &display_listener);
+    return rc;
 }
 
 static int qxl_init_secondary(PCIDevice *dev)
@@ -2052,8 +2062,8 @@ static int qxl_post_load(void *opaque, int version)
         qxl_create_guest_primary(d, 1, QXL_SYNC);
 
         /* replay surface-create and cursor-set commands */
-        cmds = g_malloc0(sizeof(QXLCommandExt) * (NUM_SURFACES + 1));
-        for (in = 0, out = 0; in < NUM_SURFACES; in++) {
+        cmds = g_malloc0(sizeof(QXLCommandExt) * (d->ssd.num_surfaces + 1));
+        for (in = 0, out = 0; in < d->ssd.num_surfaces; in++) {
             if (d->guest_surfaces.cmds[in] == 0) {
                 continue;
             }
@@ -2153,8 +2163,9 @@ static VMStateDescription qxl_vmstate = {
                              qxl_memslot, struct guest_slots),
         VMSTATE_STRUCT(guest_primary.surface, PCIQXLDevice, 0,
                        qxl_surface, QXLSurfaceCreate),
-        VMSTATE_INT32_EQUAL(num_surfaces, PCIQXLDevice),
-        VMSTATE_ARRAY(guest_surfaces.cmds, PCIQXLDevice, NUM_SURFACES, 0,
+        VMSTATE_INT32_EQUAL(ssd.num_surfaces, PCIQXLDevice),
+        VMSTATE_VARRAY_INT32(guest_surfaces.cmds, PCIQXLDevice,
+                             ssd.num_surfaces, 0,
                       vmstate_info_uint64, uint64_t),
         VMSTATE_UINT64(guest_cursor, PCIQXLDevice),
         VMSTATE_END_OF_LIST()
@@ -2183,6 +2194,7 @@ static Property qxl_properties[] = {
         DEFINE_PROP_UINT32("vram_size_mb", PCIQXLDevice, vram32_size_mb, -1),
         DEFINE_PROP_UINT32("vram64_size_mb", PCIQXLDevice, vram_size_mb, -1),
         DEFINE_PROP_UINT32("vgamem_mb", PCIQXLDevice, vgamem_size_mb, 16),
+        DEFINE_PROP_INT32("surfaces", PCIQXLDevice, ssd.num_surfaces, 1024),
         DEFINE_PROP_END_OF_LIST(),
 };
 

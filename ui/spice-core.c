@@ -464,13 +464,9 @@ SpiceInfo *qmp_query_spice(Error **errp)
         info->tls_port = tls_port;
     }
 
-#if SPICE_SERVER_VERSION >= 0x000a03 /* 0.10.3 */
     info->mouse_mode = spice_server_is_server_mouse(spice_server) ?
                        SPICE_QUERY_MOUSE_MODE_SERVER :
                        SPICE_QUERY_MOUSE_MODE_CLIENT;
-#else
-    info->mouse_mode = SPICE_QUERY_MOUSE_MODE_UNKNOWN;
-#endif
     /* for compatibility with the original command */
     info->has_channels = true;
     info->channels = qmp_query_spice_channels();
@@ -547,6 +543,17 @@ static int add_channel(const char *name, const char *value, void *opaque)
     return 0;
 }
 
+static void vm_change_state_handler(void *opaque, int running,
+                                    RunState state)
+{
+    if (running) {
+        qemu_spice_display_start();
+        spice_server_vm_start(spice_server);
+    } else {
+        spice_server_vm_stop(spice_server);
+        qemu_spice_display_stop();
+    }
+}
 void qemu_spice_init(void)
 {
     QemuOpts *opts = QTAILQ_FIRST(&qemu_spice_opts.head);
@@ -655,16 +662,11 @@ void qemu_spice_init(void)
         spice_server_set_ticket(spice_server, password, 0, 0, 0);
     }
     if (qemu_opt_get_bool(opts, "sasl", 0)) {
-#if SPICE_SERVER_VERSION >= 0x000900 /* 0.9.0 */
         if (spice_server_set_sasl_appname(spice_server, "qemu") == -1 ||
             spice_server_set_sasl(spice_server, 1) == -1) {
             error_report("spice: failed to enable sasl");
             exit(1);
         }
-#else
-        error_report("spice: sasl is not available (spice >= 0.9 required)");
-        exit(1);
-#endif
     }
     if (qemu_opt_get_bool(opts, "disable-ticketing", 0)) {
         auth = "none";
@@ -709,10 +711,8 @@ void qemu_spice_init(void)
 
     qemu_opt_foreach(opts, add_channel, &tls_port, 0);
 
-#if SPICE_SERVER_VERSION >= 0x000a02 /* 0.10.2 */
     spice_server_set_name(spice_server, qemu_name);
     spice_server_set_uuid(spice_server, qemu_uuid);
-#endif
 
     if (0 != spice_server_init(spice_server, &core_interface)) {
         error_report("failed to initialize spice server");
@@ -731,6 +731,7 @@ void qemu_spice_init(void)
     qemu_spice_input_init();
     qemu_spice_audio_init();
 
+    qemu_add_vm_change_state_handler(vm_change_state_handler, &spice_server);
     g_free(x509_key_file);
     g_free(x509_cert_file);
     g_free(x509_cacert_file);
@@ -752,6 +753,8 @@ int qemu_spice_add_interface(SpiceBaseInstance *sin)
          */
         spice_server = spice_server_new();
         spice_server_init(spice_server, &core_interface);
+        qemu_add_vm_change_state_handler(vm_change_state_handler,
+                                         &spice_server);
     }
     return spice_server_add_interface(spice_server, sin);
 }
@@ -791,15 +794,11 @@ int qemu_spice_set_pw_expire(time_t expires)
 
 int qemu_spice_display_add_client(int csock, int skipauth, int tls)
 {
-#if SPICE_SERVER_VERSION >= 0x000a01
     if (tls) {
         return spice_server_add_ssl_client(spice_server, csock, skipauth);
     } else {
         return spice_server_add_client(spice_server, csock, skipauth);
     }
-#else
-    return -1;
-#endif
 }
 
 static void spice_register_config(void)

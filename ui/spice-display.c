@@ -126,20 +126,6 @@ void qemu_spice_wakeup(SimpleSpiceDisplay *ssd)
     ssd->worker->wakeup(ssd->worker);
 }
 
-#if SPICE_SERVER_VERSION < 0x000b02 /* before 0.11.2 */
-static void qemu_spice_start(SimpleSpiceDisplay *ssd)
-{
-    trace_qemu_spice_start(ssd->qxl.id);
-    ssd->worker->start(ssd->worker);
-}
-
-static void qemu_spice_stop(SimpleSpiceDisplay *ssd)
-{
-    trace_qemu_spice_stop(ssd->qxl.id);
-    ssd->worker->stop(ssd->worker);
-}
-
-#else
 
 static int spice_display_is_running;
 
@@ -153,15 +139,9 @@ void qemu_spice_display_stop(void)
     spice_display_is_running = false;
 }
 
-#endif
-
 int qemu_spice_display_is_running(SimpleSpiceDisplay *ssd)
 {
-#if SPICE_SERVER_VERSION < 0x000b02 /* before 0.11.2 */
-    return ssd->running;
-#else
     return spice_display_is_running;
-#endif
 }
 
 static SimpleSpiceUpdate *qemu_spice_create_update(SimpleSpiceDisplay *ssd)
@@ -243,7 +223,7 @@ static SimpleSpiceUpdate *qemu_spice_create_update(SimpleSpiceDisplay *ssd)
 }
 
 /*
- * Called from spice server thread context (via interface_release_ressource)
+ * Called from spice server thread context (via interface_release_resource)
  * We do *not* hold the global qemu mutex here, so extra care is needed
  * when calling qemu functions.  QEMU interfaces used:
  *    - g_free (underlying glibc free is re-entrant).
@@ -294,28 +274,15 @@ void qemu_spice_destroy_host_primary(SimpleSpiceDisplay *ssd)
     qemu_spice_destroy_primary_surface(ssd, 0, QXL_SYNC);
 }
 
-void qemu_spice_vm_change_state_handler(void *opaque, int running,
-                                        RunState state)
-{
-#if SPICE_SERVER_VERSION < 0x000b02 /* before 0.11.2 */
-    SimpleSpiceDisplay *ssd = opaque;
-
-    if (running) {
-        ssd->running = true;
-        qemu_spice_start(ssd);
-    } else {
-        qemu_spice_stop(ssd);
-        ssd->running = false;
-    }
-#endif
-}
-
 void qemu_spice_display_init_common(SimpleSpiceDisplay *ssd, DisplayState *ds)
 {
     ssd->ds = ds;
     qemu_mutex_init(&ssd->lock);
     ssd->mouse_x = -1;
     ssd->mouse_y = -1;
+    if (ssd->num_surfaces == 0) {
+        ssd->num_surfaces = 1024;
+    }
     ssd->bufsize = (16 * 1024 * 1024);
     ssd->buf = g_malloc(ssd->bufsize);
 }
@@ -426,7 +393,7 @@ static void interface_get_init_info(QXLInstance *sin, QXLDevInitInfo *info)
     info->num_memslots_groups = NUM_MEMSLOTS_GROUPS;
     info->internal_groupslot_id = 0;
     info->qxl_ram_size = ssd->bufsize;
-    info->n_surfaces = NUM_SURFACES;
+    info->n_surfaces = ssd->num_surfaces;
 }
 
 static int interface_get_command(QXLInstance *sin, struct QXLCommandExt *ext)
@@ -491,6 +458,36 @@ static int interface_flush_resources(QXLInstance *sin)
     return 0;
 }
 
+static void interface_update_area_complete(QXLInstance *sin,
+        uint32_t surface_id,
+        QXLRect *dirty, uint32_t num_updated_rects)
+{
+    /* should never be called, used in qxl native mode only */
+    fprintf(stderr, "%s: abort()\n", __func__);
+    abort();
+}
+
+/* called from spice server thread context only */
+static void interface_async_complete(QXLInstance *sin, uint64_t cookie_token)
+{
+    /* should never be called, used in qxl native mode only */
+    fprintf(stderr, "%s: abort()\n", __func__);
+    abort();
+}
+
+static void interface_set_client_capabilities(QXLInstance *sin,
+                                              uint8_t client_present,
+                                              uint8_t caps[58])
+{
+    dprint(3, "%s:\n", __func__);
+}
+
+static int interface_client_monitors_config(QXLInstance *sin,
+                                        VDAgentMonitorsConfig *monitors_config)
+{
+    dprint(3, "%s:\n", __func__);
+    return 0; /* == not supported by guest */
+}
 static const QXLInterface dpy_interface = {
     .base.type               = SPICE_INTERFACE_QXL,
     .base.description        = "qemu simple display",
@@ -510,6 +507,10 @@ static const QXLInterface dpy_interface = {
     .req_cursor_notification = interface_req_cursor_notification,
     .notify_update           = interface_notify_update,
     .flush_resources         = interface_flush_resources,
+    .async_complete          = interface_async_complete,
+    .update_area_complete    = interface_update_area_complete,
+    .set_client_capabilities = interface_set_client_capabilities,
+    .client_monitors_config  = interface_client_monitors_config,
 };
 
 static SimpleSpiceDisplay sdpy;
@@ -539,7 +540,6 @@ void qemu_spice_display_init(DisplayState *ds)
 {
     assert(sdpy.ds == NULL);
     qemu_spice_display_init_common(&sdpy, ds);
-    register_displaychangelistener(ds, &display_listener);
 
     sdpy.qxl.base.sif = &dpy_interface.base;
     qemu_spice_add_interface(&sdpy.qxl.base);
@@ -548,4 +548,5 @@ void qemu_spice_display_init(DisplayState *ds)
     qemu_add_vm_change_state_handler(qemu_spice_vm_change_state_handler, &sdpy);
     qemu_spice_create_host_memslot(&sdpy);
     qemu_spice_create_host_primary(&sdpy);
+    register_displaychangelistener(ds, &display_listener);
 }
